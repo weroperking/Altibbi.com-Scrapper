@@ -231,7 +231,7 @@ class NameNormalizer:
         r"\s+NEW.*",  # " NEW"
         r"\s+EXTRA.*",  # " EXTRA"
         r"\s+FORTE.*",  # " FORTE"
-        r"\s+PLUS.*",  # " PLUS"
+        r"\s+PLUS\b\s*",  # " PLUS"
         r"\s+ADVANCED.*",  # " ADVANCED"
         r"\s+ORIGINAL.*",  # " ORIGINAL"
         r"\s+LIGHT.*",  # " LIGHT"
@@ -239,9 +239,9 @@ class NameNormalizer:
         r"\s+ULTRA.*",  # " ULTRA"
         r"\s+SUPER.*",  # " SUPER"
         r"\s+PRO.*",  # " PRO"
-        r"\s+ACT.*",  # " ACT"
+        r"\s+ACT\b\s*",  # " ACT"
         r"\s+RAPID.*",  # " RAPID"
-        r"\s+FAST.*",  # " FAST"
+        r"\s+FAST\b\s*",  # " FAST"
         r"\s+SLOW.*",  # " SLOW"
         r"\s+RETARD.*",  # " RETARD"
         r"\s+DELAYED.*",  # " DELAYED"
@@ -410,7 +410,7 @@ class NameNormalizer:
 
         Returns list of queries in priority order (most specific first).
         """
-        queries = []
+        queries: List[str] = []
         base = cls.normalize(trade_name)
 
         if not base:
@@ -419,13 +419,15 @@ class NameNormalizer:
         # Primary: Exact trade name on Altibbi
         queries.append(f"{base} site:altibbi.com")
 
-        # Secondary: Trade name + "duwa" (medicine in Arabic transliteration)
-        queries.append(f"{base} altibbi medicine")
+        # Secondary: Trade name with medicine term
+        queries.append(f"{base} دواء")
+        queries.append(f"{base} ادوية")
 
         # Tertiary: If base has spaces, try first word (brand name only)
         parts = base.split()
         if len(parts) > 1 and len(parts[0]) > 2:
             queries.append(f"{parts[0]} site:altibbi.com")
+            queries.append(f"{parts[0]} دواء")
 
         # Quaternary: Active ingredient search (if available)
         if active_ingredient:
@@ -433,6 +435,11 @@ class NameNormalizer:
             first_active = active_ingredient.split("+")[0].strip()
             if len(first_active) > 2:
                 queries.append(f"{first_active} site:altibbi.com")
+                queries.append(f"{first_active} دواء")
+
+        # Arabic: What is the drug pattern
+        queries.append(f"ما هو {base}")
+        queries.append(f"ما هو دواء {base}")
 
         return queries
 
@@ -567,14 +574,16 @@ class DuckDuckGoSearcher:
 
         # Pattern 1: Standard result links (result__a class)
         pattern1 = re.findall(
-            r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>'
+            r'(.*?)</a>',
             html_content,
             re.DOTALL,
         )
 
         # Pattern 2: Alternative result format
         pattern2 = re.findall(
-            r'<a[^>]*class="result__snippet"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+            r'<a[^>]*class="result__snippet"[^>]*href="([^"]*)"[^>]*>'
+            r'(.*?)</a>',
             html_content,
             re.DOTALL,
         )
@@ -596,7 +605,7 @@ class DuckDuckGoSearcher:
             # Clean URL (DuckDuckGo uses redirects)
             clean_url = self._extract_real_url(url)
 
-            if clean_url and "altibbi.com" in clean_url:
+            if clean_url and ("altibbi.com" in clean_url) and ("clinic." not in clean_url):
                 results.append(
                     {
                         "title": title,
@@ -654,7 +663,10 @@ class AltibbiScraper:
     def _get_headers(self) -> dict:
         return {
             "User-Agent": random.choice(Config.USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,*/*;q=0.8"
+            ),
             "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
             "Accept-Encoding": "identity",
             "Connection": "keep-alive",
@@ -719,13 +731,15 @@ class AltibbiScraper:
 
         # 2. Meta Description
         meta_match = re.search(
-            r'<meta[^>]*name=["\']description["\'][^>]*content=["\']([^"\']*)["\']',
+            r'<meta[^>]*name=["\']description["\'][^>]*'
+            r'content=["\']([^"\']*)["\']',
             html_content,
             re.IGNORECASE,
         )
         if not meta_match:
             meta_match = re.search(
-                r'<meta[^>]*content=["\']([^"\']*)["\'][^>]*name=["\']description["\']',
+                r'<meta[^>]*content=["\']([^"\']*)["\'][^>]*'
+                r'name=["\']description["\']',
                 html_content,
                 re.IGNORECASE,
             )
@@ -740,6 +754,7 @@ class AltibbiScraper:
             r"ما\s+هو[\s\w]*?<p[^>]*>(.*?)</p>",
             r"تعريف[\s\w]*?<p[^>]*>(.*?)</p>",
             r"نبذة[\s\w]*?<p[^>]*>(.*?)</p>",
+            r"ما هو دواء[\s\w]*?<p[^>]*>(.*?)</p>",
         ]
         for pattern in desc_patterns:
             match = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
@@ -747,29 +762,39 @@ class AltibbiScraper:
                 data["main_description"] = self._clean_html(match.group(1))
                 break
 
-        # 4. Uses ("استخدامات" section)
+        # Fallback: Extract first substantial paragraph
+        if not data.get("main_description") or len(data["main_description"]) < 100:
+            # Find paragraphs with substantial content
+            para_matches = re.findall(r"<p[^>]*>([^<>]{100,})</p>", html_content, re.DOTALL)
+            for para in para_matches:
+                clean = self._clean_html(para)
+                if len(clean) > 100 and not any(skip in clean.lower() for skip in ["cookie", "privacy", "copyright"]):
+                    data["main_description"] = clean[:500]  # Limit to first 500 chars
+                    break
+
+        # 4. Uses ("استخدامات" section) - extract from various patterns
         uses_patterns = [
-            r"استخدامات[\s\w]*?<ul[^>]*>(.*?)</ul>",
-            r"دواعي[\s\w]*?<ul[^>]*>(.*?)</ul>",
-            r"uses[\s\w]*?<ul[^>]*>(.*?)</ul>",
+            r"استخدامات[^<]*<ul[^>]*>(.*?)</ul>",
+            r"uses[^<]*<ul[^>]*>(.*?)</ul>",
         ]
         for pattern in uses_patterns:
             match = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
-            if match:
+            if match and len(match.group(1)) > 30:
                 data["uses"] = self._extract_list_items(match.group(1))
-                break
+                if len(data["uses"]) > 20:
+                    break
 
         # 5. Side Effects ("al-a'rād al-jānibīyah" section)
         side_patterns = [
-            r"الاعراض[\s\w]*?<ul[^>]*>(.*?)</ul>",
-            r"اعراض[\s\w]*?<ul[^>]*>(.*?)</ul>",
-            r"side\s+effects[\s\w]*?<ul[^>]*>(.*?)</ul>",
+            r"الاعراض[^<]*<ul[^>]*>(.*?)</ul>",
+            r"الأعراض[^<]*<ul[^>]*>(.*?)</ul>",
         ]
         for pattern in side_patterns:
             match = re.search(pattern, html_content, re.DOTALL | re.IGNORECASE)
-            if match:
+            if match and len(match.group(1)) > 30:
                 data["side_effects"] = self._extract_list_items(match.group(1))
-                break
+                if len(data["side_effects"]) > 20:
+                    break
 
         # 6. Contraindications ("mawāni' al-istikhdām" section)
         contra_patterns = [
@@ -851,8 +876,8 @@ class DatabaseManager:
     def __init__(self, input_db: str, output_db: str):
         self.input_db = input_db
         self.output_db = output_db
-        self.conn = None
-        self.cursor = None
+        self.conn: sqlite3.Connection | None = None
+        self.cursor: sqlite3.Cursor | None = None
         self._init_db()
 
     def _init_db(self):
@@ -899,6 +924,10 @@ class DatabaseManager:
             ON drug_descriptions(drug_id)
         """)
         self.cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_drug_desc
+            ON drug_descriptions(drug_id)
+        """)
+        self.cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_desc_status
             ON drug_descriptions(status)
         """)
@@ -920,6 +949,7 @@ class DatabaseManager:
             limit: Max records to fetch
             status_filter: 'pending', 'not_found', 'error', or 'all'
         """
+        assert self.cursor is not None  # noqa: S101
         query = """
             SELECT d.id, d.trade_name, d.active_ingredient, d.category, d.route
             FROM drugs d
@@ -928,18 +958,23 @@ class DatabaseManager:
         """
 
         if status_filter != "all":
-            query += f" OR dd.status = '{status_filter}'"
+            query += " OR dd.status = ?"
 
         query += " ORDER BY d.id"
 
         if limit:
             query += f" LIMIT {limit}"
 
-        self.cursor.execute(query)
+        if status_filter != "all":
+            self.cursor.execute(query, (status_filter,))
+        else:
+            self.cursor.execute(query)
+            
         return self.cursor.fetchall()
 
     def get_stats(self) -> Dict[str, int]:
         """Get processing statistics."""
+        assert self.cursor is not None  # noqa: S101
         stats = {}
 
         # Total drugs
@@ -1067,7 +1102,8 @@ class EnrichmentPipeline:
 
         Args:
             limit: Max drugs to process (None = all)
-            category_filter: Only process specific category (e.g., 'ANTIBIOTIC')
+            category_filter: Only process specific category
+                (e.g., 'ANTIBIOTIC')
         """
         print("=" * 80)
         print("DRUGGED APP - ALTIBBI DESCRIPTION ENRICHMENT PIPELINE")
@@ -1094,7 +1130,8 @@ class EnrichmentPipeline:
         # Process each drug
         for i, drug in enumerate(drugs, 1):
             print(
-                f"\n[{i}/{total}] Processing: {drug['trade_name']} (ID: {drug['id']})"
+                f"\n[{i}/{total}] Processing: "
+                f"{drug['trade_name']} (ID: {drug['id']})"
             )
             self._process_drug(drug)
 
@@ -1199,6 +1236,7 @@ class EnrichmentPipeline:
     def _assess_quality(self, data: Dict[str, str]) -> int:
         """
         Assess quality of scraped content (0-10 scale).
+        Higher scores = more comprehensive drug information.
         """
         score = 0
 
@@ -1210,15 +1248,20 @@ class EnrichmentPipeline:
         if data.get("meta_description") and len(data["meta_description"]) > 20:
             score += 2
 
-        # Has main description (3 points)
-        if data.get("main_description") and len(data["main_description"]) > 50:
-            score += 3
+        # Has main description (3 points) - longer descriptions get full points
+        if data.get("main_description"):
+            if len(data["main_description"]) > 200:
+                score += 3
+            elif len(data["main_description"]) > 100:
+                score += 2
+            else:
+                score += 1
 
-        # Has uses (2 points)
+        # Has uses (2 points) - any structured content counts
         if data.get("uses") and len(data["uses"]) > 10:
             score += 2
 
-        # Has side effects (2 points)
+        # Has side effects (2 points) - any structured content counts
         if data.get("side_effects") and len(data["side_effects"]) > 10:
             score += 2
 
@@ -1306,12 +1349,13 @@ def merge_into_original(input_db: str, enriched_db: str):
         cursor.execute("""
             ALTER TABLE drugs ADD COLUMN description TEXT
         """)
-        cursor.execute("""
-            ALTER TABLE drugs ADD COLUMN altibbi_url TEXT
-        """)
-        cursor.execute("""
-            ALTER TABLE drugs ADD COLUMN description_status TEXT DEFAULT 'pending'
-        """)
+        cursor.execute(
+            "ALTER TABLE drugs ADD COLUMN altibbi_url TEXT"
+        )
+        cursor.execute(
+            "ALTER TABLE drugs ADD COLUMN "
+            "description_status TEXT DEFAULT 'pending'"
+        )
     except sqlite3.OperationalError:
         print("[INFO] Columns already exist")
 
