@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.error
 import ssl
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -54,9 +55,9 @@ class Config:
     MAX_RESULTS_PER_QUERY = 3  # Top N results to evaluate
 
     # Throttling (CRITICAL - prevents blocking)
-    MIN_DELAY = 2.0  # Minimum seconds between requests
-    MAX_DELAY = 5.0  # Maximum seconds between requests
-    JITTER = 1.5  # Random jitter +/- seconds
+    MIN_DELAY = 1.0  # Minimum seconds between search requests
+    MAX_DELAY = 2.0  # Maximum seconds between search requests
+    JITTER = 0.5  # Random jitter +/- seconds
     TIMEOUT = 15  # Request timeout seconds
     MAX_RETRIES = 3  # Retries on failure
     RETRY_BACKOFF = 60  # Seconds to wait after 429/403
@@ -65,6 +66,11 @@ class Config:
     BATCH_SIZE = 100  # Process N drugs per batch
     DAILY_CAP = 3000  # Max requests per day
     CHECKPOINT_INTERVAL = 50  # Save progress every N drugs
+    SCRAPE_MIN_DELAY = 0.75  # Minimum seconds between page requests
+    SCRAPE_MAX_DELAY = 1.5  # Maximum seconds between page requests
+    QUERY_VARIATION_MIN_DELAY = 0.2  # Between query variations
+    QUERY_VARIATION_MAX_DELAY = 0.6  # Between query variations
+    DELAY_SCALE = 1.0  # Multiplier for all polite throttling delays
 
     # Output
     LOG_FILE = "enrichment_log.txt"
@@ -96,6 +102,14 @@ class Config:
             "Version/17.1 Safari/605.1.15"
         ),
     ]
+
+
+class DailyCapReached(RuntimeError):
+    """Raised when the configured daily request cap has been reached."""
+
+
+class SearchUnavailable(RuntimeError):
+    """Raised when the search provider cannot be reached reliably."""
 
 
 # ============================================================================
@@ -491,7 +505,7 @@ class DuckDuckGoSearcher:
         total_delay = max(0, delay + jitter - elapsed)
 
         if total_delay > 0:
-            time.sleep(total_delay)
+            time.sleep(total_delay * Config.DELAY_SCALE)
 
         self.last_request_time = time.time()
 
@@ -519,9 +533,12 @@ class DuckDuckGoSearcher:
         """
         if not self._check_daily_cap():
             print(
-                f"[WARNING] Daily cap reached ({Config.DAILY_CAP}). Stopping."
+                f"[WARNING] Daily cap reached ({Config.DAILY_CAP}). Stopping.",
+                flush=True,
             )
-            return []
+            raise DailyCapReached(
+                f"Daily search request cap reached ({Config.DAILY_CAP})"
+            )
 
         self._throttle()
 
@@ -550,7 +567,9 @@ class DuckDuckGoSearcher:
                 return self.search(query, retries + 1)
             else:
                 print(f"[HTTP ERROR {e.code}] {e.reason}")
-                return []
+                raise SearchUnavailable(
+                    f"DuckDuckGo returned HTTP {e.code}: {e.reason}"
+                )
 
         except urllib.error.URLError as e:
             if retries < Config.MAX_RETRIES:
@@ -562,7 +581,9 @@ class DuckDuckGoSearcher:
                 return self.search(query, retries + 1)
             else:
                 print(f"[URL ERROR] {e.reason}")
-                return []
+                raise SearchUnavailable(
+                    f"DuckDuckGo URL error: {e.reason}"
+                )
 
         except Exception as e:
             print(f"[ERROR] {type(e).__name__}: {e}")
@@ -655,9 +676,11 @@ class AltibbiScraper:
     def _throttle(self):
         """Throttle between page requests."""
         elapsed = time.time() - self.last_request_time
-        delay = random.uniform(1.5, 3.5)
+        delay = random.uniform(
+            Config.SCRAPE_MIN_DELAY, Config.SCRAPE_MAX_DELAY
+        )
         if elapsed < delay:
-            time.sleep(delay - elapsed)
+            time.sleep((delay - elapsed) * Config.DELAY_SCALE)
         self.last_request_time = time.time()
 
     def _get_headers(self) -> dict:
@@ -936,6 +959,32 @@ class DatabaseManager:
             ON drug_descriptions(source)
         """)
 
+        # Search/page caches avoid repeating identical network requests across
+        # resumed runs and duplicate normalized drug names.
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_cache (
+                query TEXT PRIMARY KEY,
+                result_url TEXT,
+                result_title TEXT,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_search_cache_status
+            ON search_cache(status)
+        """)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS page_cache (
+                source_url TEXT PRIMARY KEY,
+                page_data TEXT NOT NULL,
+                scraped_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         self.conn.commit()
         print("[INFO] Database initialized successfully")
 
@@ -971,6 +1020,103 @@ class DatabaseManager:
             self.cursor.execute(query)
             
         return self.cursor.fetchall()
+
+    def get_cached_search_result(
+        self, query: str
+    ) -> Optional[Dict[str, str]]:
+        """Return a cached search result for an exact query, if present."""
+        assert self.cursor is not None  # noqa: S101
+        self.cursor.execute(
+            """
+            SELECT query, result_url, result_title, status
+            FROM search_cache
+            WHERE query = ?
+        """,
+            (query,),
+        )
+        row = self.cursor.fetchone()
+        return dict(row) if row else None
+
+    def cache_search_result(
+        self, query: str, result: Optional[Dict[str, str]]
+    ):
+        """Cache the first Altibbi result, or a not-found search outcome."""
+        assert self.cursor is not None  # noqa: S101
+        if result:
+            status = "found"
+            result_url = result.get("url", "")
+            result_title = result.get("title", "")
+        else:
+            status = "not_found"
+            result_url = ""
+            result_title = ""
+
+        self.cursor.execute(
+            """
+            INSERT INTO search_cache (
+                query, result_url, result_title, status, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(query) DO UPDATE SET
+                result_url = excluded.result_url,
+                result_title = excluded.result_title,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+        """,
+            (
+                query,
+                result_url,
+                result_title,
+                status,
+                datetime.now().isoformat(),
+            ),
+        )
+
+    def get_cached_page(self, url: str) -> Optional[Dict[str, str]]:
+        """Return cached parsed page data for an Altibbi URL, if present."""
+        assert self.cursor is not None  # noqa: S101
+        self.cursor.execute(
+            """
+            SELECT page_data
+            FROM page_cache
+            WHERE source_url = ?
+        """,
+            (url,),
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+
+        try:
+            cached_data = json.loads(row["page_data"])
+        except json.JSONDecodeError:
+            return None
+
+        return cached_data if isinstance(cached_data, dict) else None
+
+    def cache_page(self, data: Dict[str, str]):
+        """Cache parsed page data so duplicate drugs do not re-scrape it."""
+        assert self.cursor is not None  # noqa: S101
+        source_url = data.get("source_url")
+        if not source_url:
+            return
+
+        self.cursor.execute(
+            """
+            INSERT INTO page_cache (
+                source_url, page_data, scraped_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(source_url) DO UPDATE SET
+                page_data = excluded.page_data,
+                scraped_at = excluded.scraped_at,
+                updated_at = excluded.updated_at
+        """,
+            (
+                source_url,
+                json.dumps(data, ensure_ascii=False),
+                data.get("scraped_at", datetime.now().isoformat()),
+                datetime.now().isoformat(),
+            ),
+        )
 
     def get_stats(self) -> Dict[str, int]:
         """Get processing statistics."""
@@ -1054,6 +1200,17 @@ class DatabaseManager:
             (drug_id, search_query, error, datetime.now().isoformat()),
         )
 
+    def mark_skipped(self, drug_id: int, error: str):
+        """Mark drug as skipped so resume mode does not revisit it."""
+        self.cursor.execute(
+            """
+            INSERT OR REPLACE INTO drug_descriptions
+            (drug_id, status, error_message, scraped_at)
+            VALUES (?, 'skipped', ?, ?)
+        """,
+            (drug_id, error, datetime.now().isoformat()),
+        )
+
     def checkpoint(self):
         """Commit current transaction."""
         self.conn.commit()
@@ -1091,6 +1248,7 @@ class EnrichmentPipeline:
             "errors": 0,
             "skipped": 0,
         }
+        self.stop_requested = False
 
     def run(
         self,
@@ -1129,6 +1287,14 @@ class EnrichmentPipeline:
 
         # Process each drug
         for i, drug in enumerate(drugs, 1):
+            if self.stop_requested:
+                print(
+                    "[INFO] Stop requested; leaving remaining drugs "
+                    "unprocessed for the next run.",
+                    flush=True,
+                )
+                break
+
             print(
                 f"\n[{i}/{total}] Processing: "
                 f"{drug['trade_name']} (ID: {drug['id']})"
@@ -1158,7 +1324,11 @@ class EnrichmentPipeline:
         clean_name = self.normalizer.normalize(trade_name)
         if not clean_name:
             print("  [SKIP] Empty name after normalization")
+            self.db.mark_skipped(
+                drug_id, "Empty name after normalization"
+            )
             self.stats["skipped"] += 1
+            self.stats["processed"] += 1
             return
 
         print(f"  Clean name: {clean_name}")
@@ -1174,36 +1344,75 @@ class EnrichmentPipeline:
 
         for query in queries:
             print(f"  Searching: {query[:60]}...")
-            results = self.searcher.search(query)
 
+            cached_result = self.db.get_cached_search_result(query)
+            if cached_result:
+                if cached_result["status"] == "found":
+                    altibbi_url = cached_result["result_url"]
+                    search_query_used = query
+                    print(f"  [CACHE HIT] URL: {altibbi_url[:70]}...")
+                    break
+
+                print("  [CACHE HIT] No Altibbi page found")
+                continue
+
+            try:
+                results = self.searcher.search(query)
+            except DailyCapReached as exc:
+                print(f"  [PAUSED] {exc}", flush=True)
+                self.stop_requested = True
+                return
+            except SearchUnavailable as exc:
+                print(f"  [PAUSED] {exc}", flush=True)
+                self.stop_requested = True
+                return
+
+            altibbi_result = None
             if results:
                 # Find first Altibbi result
                 for result in results:
                     if "altibbi.com" in result["url"]:
+                        altibbi_result = result
                         altibbi_url = result["url"]
                         search_query_used = query
                         print(f"  [FOUND] URL: {altibbi_url[:70]}...")
                         break
 
-                if altibbi_url:
-                    break
+            self.db.cache_search_result(query, altibbi_result)
 
-            time.sleep(random.uniform(1, 2))  # Between query variations
+            if altibbi_url:
+                break
+
+            time.sleep(
+                random.uniform(
+                    Config.QUERY_VARIATION_MIN_DELAY,
+                    Config.QUERY_VARIATION_MAX_DELAY,
+                )
+                * Config.DELAY_SCALE
+            )  # Between query variations
 
         if not altibbi_url:
             print("  [NOT FOUND] No Altibbi page found")
             self.db.mark_not_found(drug_id, queries[0] if queries else "")
             self.stats["not_found"] += 1
+            self.stats["processed"] += 1
             return
 
         # Step 4: Scrape Altibbi page
-        print(f"  Scraping: {altibbi_url[:60]}...")
-        page_data = self.scraper.scrape(altibbi_url)
+        page_data = self.db.get_cached_page(altibbi_url)
+        if page_data:
+            print(f"  [PAGE CACHE HIT] {altibbi_url[:60]}...")
+        else:
+            print(f"  Scraping: {altibbi_url[:60]}...")
+            page_data = self.scraper.scrape(altibbi_url)
+            if page_data:
+                self.db.cache_page(page_data)
 
         if not page_data:
             print("  [ERROR] Failed to scrape page")
             self.db.mark_error(drug_id, search_query_used, "Scrape failed")
             self.stats["errors"] += 1
+            self.stats["processed"] += 1
             return
 
         # Step 5: Validate content quality
@@ -1216,6 +1425,7 @@ class EnrichmentPipeline:
                 drug_id, search_query_used, "Low quality content"
             )
             self.stats["errors"] += 1
+            self.stats["processed"] += 1
             return
 
         # Step 6: Save to database
@@ -1276,7 +1486,7 @@ class EnrichmentPipeline:
         print(f"  Not Found:   {self.stats['not_found']}")
         print(f"  Errors:      {self.stats['errors']}")
         print(f"  Skipped:     {self.stats['skipped']}")
-        print(f"  Total:       {sum(self.stats.values())}")
+        print(f"  Total:       {self.stats['processed']}")
 
         db_stats = self.db.get_stats()
         print("\n[DATABASE]")
@@ -1437,12 +1647,22 @@ def main():
     parser.add_argument(
         "--test", action="store_true", help="Test mode: process only 5 drugs"
     )
+    parser.add_argument(
+        "--delay-scale",
+        type=float,
+        default=Config.DELAY_SCALE,
+        help=(
+            "Scale all polite throttling delays. Use 1.0 for the default "
+            "balanced speed, 0.5 for faster runs, or 2.0 for extra caution."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Update config
     Config.INPUT_DB = args.input
     Config.OUTPUT_DB = args.output
+    Config.DELAY_SCALE = max(0.0, args.delay_scale)
 
     # Test mode
     if args.test:
