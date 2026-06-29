@@ -1,0 +1,5 @@
+pip install rapidfuzz
+python enrich_monographs.py \
+  --db   drugged.db \
+  --csv  drowsyng.csv \
+  --threshold 80
