@@ -1,330 +1,228 @@
 """
-enrich_monographs.py
---------------------
-Links your existing Egyptian drugs SQLite database to Drowsyng clinical
-monograph data via active_ingredient → generic_name fuzzy matching.
-
-Usage:
-    python enrich_monographs.py \
-        --db      output/egyptian_pharma.sqlite \
-        --csv     data/drowsyng.csv \
-        --threshold 80
-
-Output:
-    Adds a `monographs` table to your existing SQLite DB.
-    Each row is linked to drugs.id via drug_id (foreign key).
+enrich_monographs.py  (v3 — fixes section parsing for no-newline Drowsyng blobs)
+---------------------------------------------------------------------------------
+python enrich_monographs.py --db drugged.db --csv drowsyng.csv --threshold 72
 """
 
-import argparse
-import csv
-import re
-import sqlite3
-import sys
+import argparse, csv, re, sqlite3, sys
 from pathlib import Path
-
 from rapidfuzz import fuzz, process
 
-# ---------------------------------------------------------------------------
-# Section parser
-# ---------------------------------------------------------------------------
+# ── Normalizer ───────────────────────────────────────────────────────────────
 
-# Common headings found in Drowsyng drug_content blobs.
-# Order matters: earlier patterns shadow later ones during splitting.
-SECTION_PATTERNS = [
-    ("uses",            r"uses?|indications?|used\s+for|what\s+is\s+.+used\s+for"),
-    ("mechanism",       r"how\s+.+works?|mechanism\s+of\s+action|pharmacology"),
-    ("dosage",          r"dosage|dose|how\s+to\s+use|directions?|administration"),
-    ("warnings",        r"warnings?|precautions?|before\s+you\s+use|caution"),
-    ("side_effects",    r"side[\s\-]?effects?|adverse\s+(effects?|reactions?)"),
-    ("interactions",    r"interactions?|drug\s+interactions?"),
-    ("contraindications", r"contraindications?|do\s+not\s+use|when\s+not\s+to\s+use"),
-    ("storage",         r"storage|store|keep"),
-]
-
-# Build one compiled regex that detects any heading line
-_HEADING_RE = re.compile(
-    r"^\s*(?:" + "|".join(p for _, p in SECTION_PATTERNS) + r")\s*[:\-]?\s*$",
-    re.IGNORECASE | re.MULTILINE,
+_PREFIX_RE = re.compile(r"^generic\s+name\s*", re.IGNORECASE)
+_SALT_RE   = re.compile(
+    r"\b(hydrochloride|hcl|trihydrate|monohydrate|sodium|potassium|calcium"
+    r"|sulfate|sulphate|phosphate|maleate|tartrate|acetate|nitrate|citrate"
+    r"|bisglycinate|gluconate|fumarate|succinate|bromide|chloride|iodide"
+    r"|benzoate|stearate|oxide|carbonate|hydroxide|lactate|decanoate"
+    r"|mg|mcg|ug|g\b|ml|%|iu|i\.u|meq|fip|drops?)\b",
+    re.IGNORECASE,
+)
+_NUM_RE  = re.compile(r"\b\d+(\.\d+)?\b")
+_JUNK_RE = re.compile(
+    r"\b(tablet|capsule|injection|solution|cream|gel|ointment|syrup|suspension"
+    r"|oral|topical|serving|ingredients?|complex|extract|traditional|active"
+    r"|mkt|country|origin|strip|vit\b|vitamin\b)\b",
+    re.IGNORECASE,
 )
 
-def _label_for(heading_text: str) -> str:
-    h = heading_text.strip().lower()
-    for label, pattern in SECTION_PATTERNS:
-        if re.search(pattern, h, re.IGNORECASE):
+def normalize(text: str) -> str:
+    if not text: return ""
+    t = text.lower()
+    t = _PREFIX_RE.sub("", t)
+    t = _SALT_RE.sub(" ", t)
+    t = _NUM_RE.sub(" ", t)
+    t = _JUNK_RE.sub(" ", t)
+    t = re.sub(r"[^\w\s\+]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+_JUNK_NORM_RE = re.compile(r"^[\d\s\-\.]+$")
+
+def is_dirty(raw: str, norm: str) -> bool:
+    if not raw or not norm: return True
+    if _JUNK_NORM_RE.match(norm): return True
+    if len(norm) < 4: return True
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw.strip()): return True
+    return False
+
+# ── Section parser (handles Drowsyng's no-newline blobs) ────────────────────
+#
+# Drowsyng content is one continuous string like:
+#   "INTRODUCTION ABOUT DRUGXDRUGX contains ... USES OF DRUGXDrugx is used..."
+# We split on the ALL-CAPS heading boundaries.
+
+_HEADING_SPLIT = re.compile(
+    r"((?:INTRODUCTION ABOUT|USES OF|HOW .{1,50} WORKS?|"
+    r"WARNINGS? AND PRECAUTIONS?|SIDE EFFECTS? OF|"
+    r"DRUG INTERACTIONS? OF|CONTRAINDICATIONS? OF|"
+    r"DOSAGE AND DIRECTIONS?|DIRECTIONS? FOR USE|"
+    r"HOW TO USE|STORAGE OF|STORAGE AND DISPOSAL)"
+    r"[^a-z]{0,50}?)(?=[A-Z][a-z])"
+)
+
+_SECTION_MAP = [
+    ("uses",              re.compile(r"introduction about|uses of|indications", re.I)),
+    ("mechanism",         re.compile(r"how .+ works?|mechanism", re.I)),
+    ("dosage",            re.compile(r"dosage|directions? for use|how to use", re.I)),
+    ("warnings",          re.compile(r"warnings?|precautions?", re.I)),
+    ("side_effects",      re.compile(r"side.?effects?", re.I)),
+    ("interactions",      re.compile(r"interactions?", re.I)),
+    ("contraindications", re.compile(r"contraindications?", re.I)),
+    ("storage",           re.compile(r"storage", re.I)),
+]
+
+def label_heading(heading: str) -> str:
+    for label, pat in _SECTION_MAP:
+        if pat.search(heading):
             return label
     return "other"
 
-
 def parse_sections(content: str) -> dict[str, str]:
-    """
-    Split a free-text drug_content blob into labelled sections.
-    Returns a dict like:
-        {"uses": "...", "warnings": "...", "side_effects": "...", ...}
-    Falls back to storing the whole blob under "uses" if no headings found.
-    """
     if not content:
         return {}
 
-    # Try to split on heading lines
-    parts = re.split(r"\n(?=\s*[A-Z][^\n]{0,60}[:\-]?\s*\n)", content)
+    parts = _HEADING_SPLIT.split(content)
+    # parts alternates: [pre, heading, body, heading, body, ...]
+    sections: dict[str, str] = {}
+
     if len(parts) <= 1:
-        # No clear heading breaks — store entire content as uses
+        # No headings found — store whole thing as uses
         return {"uses": content.strip()}
 
-    sections: dict[str, str] = {}
-    current_label = "uses"
-    current_lines: list[str] = []
+    # First chunk before any heading goes to uses
+    if parts[0].strip():
+        sections["uses"] = parts[0].strip()
 
-    for line in content.splitlines():
-        if _HEADING_RE.match(line):
-            if current_lines:
-                text = "\n".join(current_lines).strip()
-                if text:
-                    sections[current_label] = text
-            current_label = _label_for(line)
-            current_lines = []
-        else:
-            current_lines.append(line)
+    i = 1
+    while i < len(parts) - 1:
+        heading = parts[i].strip()
+        body    = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        label   = label_heading(heading)
+        if body:
+            sections.setdefault(label, body)
+        i += 2
 
-    if current_lines:
-        text = "\n".join(current_lines).strip()
-        if text:
-            sections[current_label] = text
+    return sections or {"uses": content.strip()}
 
-    # If parsing produced nothing useful, store whole blob
-    if not sections:
-        sections["uses"] = content.strip()
+# ── CSV loader ───────────────────────────────────────────────────────────────
 
-    return sections
-
-
-# ---------------------------------------------------------------------------
-# Normalizer
-# ---------------------------------------------------------------------------
-
-_STRIP_RE = re.compile(
-    r"\b(hydrochloride|hcl|trihydrate|monohydrate|sodium|potassium|calcium"
-    r"|sulfate|sulphate|phosphate|maleate|tartrate|acetate|nitrate|citrate"
-    r"|mg|mcg|g|ml|%|iu|tablet|capsule|injection|solution|cream|gel|drops?)\b",
-    re.IGNORECASE,
-)
-_WS_RE = re.compile(r"\s+")
-
-
-def normalize_ingredient(text: str) -> str:
-    """Lowercase, strip salt suffixes and units, collapse whitespace."""
-    if not text:
-        return ""
-    t = text.lower()
-    t = _STRIP_RE.sub(" ", t)
-    t = re.sub(r"[^\w\s\+\-]", " ", t)
-    t = _WS_RE.sub(" ", t).strip()
-    return t
-
-
-# ---------------------------------------------------------------------------
-# CSV loader
-# ---------------------------------------------------------------------------
-
-# Flexible column aliases for the Drowsyng CSV
-_COL_ALIASES = {
-    "generic_name":  ["generic_name", "generic", "active_ingredient", "active ingredient"],
-    "med_name":      ["med_name", "medicine_name", "drug_name", "name", "brand_name"],
-    "drug_content":  ["drug_content", "content", "description", "monograph", "details"],
-    "disease_name":  ["disease_name", "disease", "indication", "condition"],
-}
-
-
-def _resolve_col(header: list[str], aliases: list[str]) -> str | None:
-    h_lower = [c.lower().strip() for c in header]
-    for alias in aliases:
-        if alias in h_lower:
-            return header[h_lower.index(alias)]
-    return None
-
-
-def load_drowsyng(csv_path: str) -> list[dict]:
-    """
-    Load Drowsyng CSV rows, resolving flexible column names.
-    Returns list of dicts with keys: generic_name, med_name, drug_content, disease_name.
-    Skips rows where both generic_name and med_name are empty.
-    """
-    rows = []
+def load_drowsyng(csv_path: str) -> tuple[list[str], dict[str, list[dict]]]:
+    index: dict[str, list[dict]] = {}
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        header = reader.fieldnames or []
-
-        col = {
-            field: _resolve_col(list(header), aliases)
-            for field, aliases in _COL_ALIASES.items()
-        }
-
-        missing = [f for f, c in col.items() if c is None and f in ("generic_name", "drug_content")]
-        if missing:
-            print(f"[WARN] Could not find columns for: {missing}")
-            print(f"       Available columns: {header}")
-
-        for raw in reader:
-            generic  = (raw.get(col["generic_name"])  or "").strip() if col["generic_name"]  else ""
-            med      = (raw.get(col["med_name"])       or "").strip() if col["med_name"]       else ""
-            content  = (raw.get(col["drug_content"])   or "").strip() if col["drug_content"]   else ""
-            disease  = (raw.get(col["disease_name"])   or "").strip() if col["disease_name"]   else ""
-
-            if not generic and not med:
-                continue
-            if not content:
-                continue
-
-            rows.append({
+        for row in csv.DictReader(f):
+            generic = (row.get("generic_name") or "").strip()
+            content = (row.get("drug_content")  or "").strip()
+            disease = (row.get("disease_name")  or "").strip()
+            if not content: continue
+            norm = normalize(generic)
+            if not norm or is_dirty(generic, norm): continue
+            index.setdefault(norm, []).append({
                 "generic_name": generic,
-                "med_name":     med,
                 "drug_content": content,
                 "disease_name": disease,
-                "norm_generic": normalize_ingredient(generic or med),
             })
-
-    print(f"[INFO] Loaded {len(rows)} Drowsyng rows with content")
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# Fuzzy matcher
-# ---------------------------------------------------------------------------
-
-def build_index(drowsyng_rows: list[dict]) -> dict[str, list[dict]]:
-    """
-    Group Drowsyng rows by normalized generic_name.
-    One generic can have multiple rows (different disease contexts).
-    """
-    index: dict[str, list[dict]] = {}
-    for row in drowsyng_rows:
-        key = row["norm_generic"]
-        if key:
-            index.setdefault(key, []).append(row)
-    return index
-
-
-def find_best_match(
-    norm_ingredient: str,
-    index: dict[str, list[dict]],
-    threshold: int,
-) -> list[dict] | None:
-    """
-    Return Drowsyng rows for the best-matching generic_name, or None.
-    Uses token_sort_ratio for salt-stripped, reordered names.
-    """
-    if not norm_ingredient or not index:
-        return None
-
     keys = list(index.keys())
-    result = process.extractOne(
-        norm_ingredient,
-        keys,
-        scorer=fuzz.token_sort_ratio,
-        score_cutoff=threshold,
-    )
-    if result:
-        matched_key, score, _ = result
-        return index[matched_key]
+    print(f"[INFO] Drowsyng: {len(keys)} unique normalized generics")
+    return keys, index
+
+# ── Matcher ──────────────────────────────────────────────────────────────────
+
+def match(norm_ingredient: str, keys: list[str], threshold: int) -> str | None:
+    if not norm_ingredient or not keys: return None
+    if norm_ingredient in keys: return norm_ingredient
+    parts = [p.strip() for p in norm_ingredient.split("+") if p.strip()]
+    candidates = [norm_ingredient] + (parts if len(parts) > 1 else [])
+    for candidate in candidates:
+        result = process.extractOne(
+            candidate, keys,
+            scorer=fuzz.token_sort_ratio,
+            score_cutoff=threshold,
+        )
+        if result:
+            return result[0]
     return None
 
+# ── Schema ───────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-
-SCHEMA_SQL = """
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS monographs (
-    id          INTEGER PRIMARY KEY,
-    drug_id     INTEGER NOT NULL REFERENCES drugs(id) ON DELETE CASCADE,
-    section     TEXT    NOT NULL,   -- 'uses' | 'mechanism' | 'dosage' | 'warnings' |
-                                    -- 'side_effects' | 'interactions' | 'contraindications' |
-                                    -- 'storage' | 'other'
-    content     TEXT    NOT NULL,
-    language    TEXT    NOT NULL DEFAULT 'en',
-    source      TEXT    DEFAULT 'Drowsyng Dataset',
+    id      INTEGER PRIMARY KEY,
+    drug_id INTEGER NOT NULL REFERENCES drugs(id) ON DELETE CASCADE,
+    section TEXT    NOT NULL,
+    content TEXT    NOT NULL,
+    language TEXT   NOT NULL DEFAULT 'en',
+    source  TEXT    DEFAULT 'Drowsyng/Netmeds',
     UNIQUE(drug_id, section, language)
 );
-
-CREATE INDEX IF NOT EXISTS idx_monograph_drug   ON monographs(drug_id);
-CREATE INDEX IF NOT EXISTS idx_monograph_section ON monographs(section);
-
--- FTS5 for full-text search across monograph content
+CREATE INDEX IF NOT EXISTS idx_mono_drug    ON monographs(drug_id);
+CREATE INDEX IF NOT EXISTS idx_mono_section ON monographs(section);
 CREATE VIRTUAL TABLE IF NOT EXISTS monographs_fts USING fts5(
     content,
     section UNINDEXED,
-    language UNINDEXED,
     content='monographs',
     content_rowid='id',
     tokenize='unicode61 remove_diacritics 1'
 );
-
--- Keep FTS in sync
-CREATE TRIGGER IF NOT EXISTS monographs_ai AFTER INSERT ON monographs BEGIN
-    INSERT INTO monographs_fts(rowid, content, section, language)
-    VALUES (new.id, new.content, new.section, new.language);
+CREATE TRIGGER IF NOT EXISTS mono_ai AFTER INSERT ON monographs BEGIN
+    INSERT INTO monographs_fts(rowid, content, section)
+    VALUES (new.id, new.content, new.section);
 END;
-CREATE TRIGGER IF NOT EXISTS monographs_ad AFTER DELETE ON monographs BEGIN
-    INSERT INTO monographs_fts(monographs_fts, rowid, content, section, language)
-    VALUES ('delete', old.id, old.content, old.section, old.language);
-END;
-CREATE TRIGGER IF NOT EXISTS monographs_au AFTER UPDATE ON monographs BEGIN
-    INSERT INTO monographs_fts(monographs_fts, rowid, content, section, language)
-    VALUES ('delete', old.id, old.content, old.section, old.language);
-    INSERT INTO monographs_fts(rowid, content, section, language)
-    VALUES (new.id, new.content, new.section, new.language);
+CREATE TRIGGER IF NOT EXISTS mono_ad AFTER DELETE ON monographs BEGIN
+    INSERT INTO monographs_fts(monographs_fts, rowid, content, section)
+    VALUES ('delete', old.id, old.content, old.section);
 END;
 """
 
-
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
+# ── Pipeline ─────────────────────────────────────────────────────────────────
 
 def enrich(db_path: str, csv_path: str, threshold: int) -> None:
-    drowsyng = load_drowsyng(csv_path)
-    index    = build_index(drowsyng)
+    keys, index = load_drowsyng(csv_path)
 
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA foreign_keys = ON")
-    con.executescript(SCHEMA_SQL)
+    con.executescript(SCHEMA)
 
-    # Load drugs that have an active_ingredient and no monograph yet
-    cur = con.execute("""
-        SELECT d.id, d.trade_name, d.active_ingredient
-        FROM drugs d
-        WHERE d.active_ingredient IS NOT NULL
-          AND d.active_ingredient != ''
-          AND NOT EXISTS (
-              SELECT 1 FROM monographs m WHERE m.drug_id = d.id
-          )
-    """)
-    drugs = cur.fetchall()
+    # Drop existing monographs so we re-insert with fixed section parser
+    existing = con.execute("SELECT COUNT(*) FROM monographs").fetchone()[0]
+    if existing > 0:
+        print(f"[INFO] Dropping {existing} existing monograph rows to re-parse sections...")
+        con.execute("DELETE FROM monographs")
+        con.execute("DELETE FROM monographs_fts")
+        con.commit()
+
+    drugs = con.execute("""
+        SELECT id, trade_name, active_ingredient FROM drugs
+        WHERE active_ingredient IS NOT NULL
+          AND active_ingredient != ''
+          AND active_ingredient NOT GLOB '[0-9]*'
+    """).fetchall()
+
     print(f"[INFO] {len(drugs)} drugs to enrich")
 
-    matched = skipped = inserted = 0
+    matched = skipped = dirty = inserted = 0
 
     for drug_id, trade_name, active_ingredient in drugs:
-        norm = normalize_ingredient(active_ingredient)
-        candidates = find_best_match(norm, index, threshold)
+        norm = normalize(active_ingredient)
+        if is_dirty(active_ingredient, norm):
+            dirty += 1
+            continue
 
-        if not candidates:
+        best_key = match(norm, keys, threshold)
+        if not best_key:
             skipped += 1
             continue
 
         matched += 1
-        # Merge content from all matched rows (different disease contexts)
-        merged_content = "\n\n".join(
-            r["drug_content"] for r in candidates if r["drug_content"]
-        )
-        sections = parse_sections(merged_content)
+        merged = "\n\n".join(r["drug_content"] for r in index[best_key] if r["drug_content"])
+        sections = parse_sections(merged)
 
         for section_name, section_text in sections.items():
             try:
                 con.execute("""
                     INSERT OR IGNORE INTO monographs
                         (drug_id, section, content, language, source)
-                    VALUES (?, ?, ?, 'en', 'Drowsyng Dataset')
+                    VALUES (?, ?, ?, 'en', 'Drowsyng/Netmeds')
                 """, (drug_id, section_name, section_text))
                 inserted += 1
             except sqlite3.IntegrityError:
@@ -333,35 +231,23 @@ def enrich(db_path: str, csv_path: str, threshold: int) -> None:
     con.commit()
     con.close()
 
-    print(f"[INFO] Done — matched: {matched} | skipped: {skipped} | sections inserted: {inserted}")
+    avg_sections = round(inserted / matched, 1) if matched else 0
+    print(f"\n[RESULT] matched={matched}  skipped={skipped}  dirty={dirty}")
+    print(f"         sections inserted={inserted}  avg per drug={avg_sections}")
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Enrich Egyptian drugs SQLite DB with Drowsyng clinical monographs"
-    )
-    parser.add_argument("--db",        required=True, help="Path to your SQLite database")
-    parser.add_argument("--csv",       required=True, help="Path to Drowsyng CSV file")
-    parser.add_argument("--threshold", type=int, default=80,
-                        help="Fuzzy match score cutoff 0–100 (default: 80)")
-    args = parser.parse_args()
-
-    if not Path(args.db).exists():
-        print(f"[ERROR] DB not found: {args.db}", file=sys.stderr)
-        sys.exit(1)
-    if not Path(args.csv).exists():
-        print(f"[ERROR] CSV not found: {args.csv}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"[INFO] DB:        {args.db}")
-    print(f"[INFO] CSV:       {args.csv}")
-    print(f"[INFO] Threshold: {args.threshold}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db",        required=True)
+    ap.add_argument("--csv",       required=True)
+    ap.add_argument("--threshold", type=int, default=72)
+    args = ap.parse_args()
+    for p, label in [(args.db, "DB"), (args.csv, "CSV")]:
+        if not Path(p).exists():
+            print(f"[ERROR] {label} not found: {p}", file=sys.stderr); sys.exit(1)
+    print(f"[INFO] DB={args.db}  CSV={args.csv}  threshold={args.threshold}")
     enrich(args.db, args.csv, args.threshold)
-
 
 if __name__ == "__main__":
     main()
